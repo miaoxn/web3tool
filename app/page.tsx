@@ -40,15 +40,7 @@ import {
 import { parseEther, formatEther } from 'viem';
 
 // --- CONFIGURATION ---
-// 请前往 [https://cloud.walletconnect.com](https://cloud.walletconnect.com) 获取您自己的 Project ID
-const projectId = 'YOUR_PROJECT_ID'; 
-
-const config = getDefaultConfig({
-  appName: 'Universal Contract Debugger',
-  projectId: projectId,
-  chains: [mainnet, polygon, optimism, arbitrum, base, sepolia, bsc, bscTestnet],
-  ssr: true,
-});
+const FALLBACK_WALLETCONNECT_PROJECT_ID = 'YOUR_PROJECT_ID';
 
 const queryClient = new QueryClient();
 
@@ -549,9 +541,50 @@ function DebuggerContent() {
 
 // --- ROOT WRAPPER ---
 export default function ContractDebuggerPage() {
+  const [isMounted, setIsMounted] = useState(false);
+  const [wagmiConfig, setWagmiConfig] = useState<ReturnType<typeof getDefaultConfig> | null>(null);
+  const [projectIdReady, setProjectIdReady] = useState(true);
+
+  useEffect(() => {
+    setIsMounted(true);
+    const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID?.trim() || FALLBACK_WALLETCONNECT_PROJECT_ID;
+    const hasValidProjectId = projectId !== FALLBACK_WALLETCONNECT_PROJECT_ID;
+    setProjectIdReady(hasValidProjectId);
+
+    if (!hasValidProjectId) {
+      console.warn("WalletConnect Project ID 未配置，请在 Vercel 环境变量中设置 NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID。");
+    }
+
+    setWagmiConfig(
+      getDefaultConfig({
+        appName: 'Universal Contract Debugger',
+        projectId,
+        chains: [mainnet, polygon, optimism, arbitrum, base, sepolia, bsc, bscTestnet],
+        ssr: false,
+      })
+    );
+  }, []);
+
+  // 仅在客户端初始化 wagmi，避免构建/预渲染阶段触发 indexedDB
+  if (!isMounted || !wagmiConfig) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-200">
+        <div className="text-center">
+          <div className="w-8 h-8 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-sm text-slate-400">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <WagmiProvider config={config}>
+    <WagmiProvider config={wagmiConfig}>
       <QueryClientProvider client={queryClient}>
+        {!projectIdReady && (
+          <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[100] px-3 py-2 rounded-md text-xs bg-amber-500/15 text-amber-300 border border-amber-500/30">
+            请在 Vercel 设置 `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID`，否则钱包连接不可用。
+          </div>
+        )}
         <DebuggerContent />
       </QueryClientProvider>
     </WagmiProvider>

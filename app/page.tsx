@@ -39,7 +39,7 @@ import {
   QueryClientProvider,
   QueryClient,
 } from "@tanstack/react-query";
-import { parseEther, formatEther, getAddress, isAddress } from 'viem';
+import { decodeErrorResult, parseEther, formatEther, getAddress, isAddress, type Hex } from 'viem';
 
 // --- CONFIGURATION ---
 const FALLBACK_WALLETCONNECT_PROJECT_ID = 'YOUR_PROJECT_ID';
@@ -112,7 +112,10 @@ const APP_THEMES = {
       accentSecondary: 'bg-blue-500/10 text-blue-300 border-blue-500/25',
       success: 'text-emerald-400',
       error: 'text-red-400',
-      info: 'text-blue-400'
+      info: 'text-blue-400',
+      badgeRead: 'bg-cyan-500/10 text-cyan-300 border-cyan-500/25',
+      badgeWrite: 'bg-violet-500/10 text-violet-300 border-violet-500/25',
+      badgePayable: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/25'
     }
   },
   light: {
@@ -135,7 +138,10 @@ const APP_THEMES = {
       accentSecondary: 'bg-blue-100 text-blue-700 border-blue-200',
       success: 'text-emerald-600',
       error: 'text-red-600',
-      info: 'text-blue-600'
+      info: 'text-blue-600',
+      badgeRead: 'bg-cyan-50 text-cyan-700 border-cyan-200',
+      badgeWrite: 'bg-violet-50 text-violet-700 border-violet-200',
+      badgePayable: 'bg-emerald-50 text-emerald-700 border-emerald-200'
     }
   },
   ocean: {
@@ -158,7 +164,10 @@ const APP_THEMES = {
       accentSecondary: 'bg-cyan-900/30 text-cyan-400 border-cyan-800',
       success: 'text-emerald-400',
       error: 'text-rose-400',
-      info: 'text-cyan-400'
+      info: 'text-cyan-400',
+      badgeRead: 'bg-cyan-400/10 text-cyan-300 border-cyan-400/25',
+      badgeWrite: 'bg-indigo-400/10 text-indigo-300 border-indigo-400/25',
+      badgePayable: 'bg-emerald-400/10 text-emerald-300 border-emerald-400/25'
     }
   }
 };
@@ -182,11 +191,74 @@ type ABIParam = {
   internalType?: string;
 };
 
+type ABIErrorDefinition = {
+  name: string;
+  type: 'error';
+  inputs: ABIParam[];
+};
+
+type DecodedContractError = {
+  errorName: string;
+  signature: string;
+  args?: unknown;
+  raw?: Hex;
+};
+
+const toSerializable = (value: unknown): unknown => {
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) return value.map(toSerializable);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, toSerializable(item)]));
+  return value;
+};
+
+const decodeContractError = (error: unknown, abiErrors: ABIErrorDefinition[]): DecodedContractError | null => {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current && typeof current === 'object'; depth += 1) {
+    const record = current as Record<string, unknown>;
+    const decoded = record.data;
+    if (decoded && typeof decoded === 'object') {
+      const decodedRecord = decoded as Record<string, unknown>;
+      if (typeof decodedRecord.errorName === 'string') {
+        const definition = abiErrors.find(item => item.name === decodedRecord.errorName);
+        return {
+          errorName: decodedRecord.errorName,
+          signature: definition ? `${definition.name}(${definition.inputs.map(input => input.type).join(',')})` : decodedRecord.errorName,
+          args: toSerializable(decodedRecord.args),
+          raw: typeof record.raw === 'string' ? record.raw as Hex : undefined,
+        };
+      }
+    }
+
+    const nestedData = decoded && typeof decoded === 'object' ? (decoded as Record<string, unknown>).data : undefined;
+    const raw = [record.raw, decoded, nestedData].find(value => typeof value === 'string' && value.startsWith('0x')) as Hex | undefined;
+    if (raw) {
+      try {
+        const result = decodeErrorResult({ abi: abiErrors, data: raw });
+        const definition = abiErrors.find(item => item.name === result.errorName);
+        return {
+          errorName: result.errorName,
+          signature: definition ? `${definition.name}(${definition.inputs.map(input => input.type).join(',')})` : result.errorName,
+          args: toSerializable(result.args),
+          raw,
+        };
+      } catch {}
+    }
+    current = record.cause;
+  }
+  return null;
+};
+
 type LogEntry = {
   timestamp: Date;
   type: 'info' | 'success' | 'error' | 'warning';
   message: string;
   data?: any;
+};
+
+type ExecutionResult = {
+  type: 'info' | 'success' | 'error';
+  title: string;
+  data?: unknown;
 };
 
 type SavedContract = {
@@ -201,9 +273,9 @@ type SavedContract = {
 
 // --- DYNAMIC INPUT COMPONENT ---
 const DynamicInput = ({ 
-  type, name, value, onChange, components, depth = 0, colors, currentUserAddress, error
+  type, name, value, onChange, onBlur, components, depth = 0, colors, currentUserAddress, error
 }: { 
-  type: string; name: string; value: any; onChange: (val: any) => void; components?: ABIParam[]; depth?: number; colors: ThemeConfig; currentUserAddress?: string; error?: string | null
+  type: string; name: string; value: any; onChange: (val: any) => void; onBlur?: () => void; components?: ABIParam[]; depth?: number; colors: ThemeConfig; currentUserAddress?: string; error?: string | null
 }) => {
   const isArray = type.endsWith('[]');
   const isTuple = type.startsWith('tuple') || (type === 'tuple' && components);
@@ -231,7 +303,7 @@ const DynamicInput = ({
             <div className="flex-1">
               <DynamicInput type={baseType} name={`[${idx}]`} value={item} components={components} depth={depth + 1} onChange={(newVal) => {
                   const newArr = [...arrValue]; newArr[idx] = newVal; onChange(newArr);
-                }} colors={colors} currentUserAddress={currentUserAddress} />
+                }} onBlur={onBlur} colors={colors} currentUserAddress={currentUserAddress} />
             </div>
             <button onClick={() => { const newArr = arrValue.filter((_: any, i: number) => i !== idx); onChange(newArr); }} 
               aria-label={`Remove ${name || 'array'} item ${idx + 1}`} className={`mt-1 p-1.5 ${colors.textDim} hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors`}><Trash2 size={14} /></button>
@@ -252,7 +324,7 @@ const DynamicInput = ({
         {components.map((comp, idx) => (
           <DynamicInput key={idx} type={comp.type} name={comp.name} value={objValue[idx]} components={comp.components} depth={depth + 1} onChange={(newVal) => {
               const newObj = Array.isArray(objValue) ? [...objValue] : []; newObj[idx] = newVal; onChange(newObj);
-            }} colors={colors} currentUserAddress={currentUserAddress} />
+            }} onBlur={onBlur} colors={colors} currentUserAddress={currentUserAddress} />
         ))}
       </div>
     );
@@ -299,13 +371,14 @@ const DynamicInput = ({
       <select 
         value={type === 'bool' ? (value === true ? 'true' : 'false') : undefined}
         onChange={type === 'bool' ? (e) => onChange(e.target.value === 'true') : undefined}
+        onBlur={onBlur}
         className={inputClass} style={{ display: type === 'bool' ? 'block' : 'none' }}
       >
         <option value="false">false</option>
         <option value="true">true</option>
       </select>
       {type !== 'bool' && (
-        <input type="text" value={value || ''} placeholder={`${type} value...`} onChange={(e) => onChange(e.target.value)} className={inputClass} />
+        <input type="text" value={value || ''} placeholder={`${type} value...`} onChange={(e) => onChange(e.target.value)} onBlur={onBlur} className={inputClass} />
       )}
       {error && <p className="mt-1.5 text-[11px] text-red-400 flex items-center gap-1"><AlertTriangle size={11} />{error}</p>}
     </div>
@@ -325,14 +398,19 @@ function DebuggerContent() {
   const [address, setAddress] = useState('');
   const [abiInput, setAbiInput] = useState('');
   const [parsedAbi, setParsedAbi] = useState<ABIFunction[]>([]);
+  const [parsedAbiErrors, setParsedAbiErrors] = useState<ABIErrorDefinition[]>([]);
   const [abiError, setAbiError] = useState('');
   const [selectedFunc, setSelectedFunc] = useState<ABIFunction | null>(null);
   const [funcArgs, setFuncArgs] = useState<any[]>([]);
+  const [touchedArgs, setTouchedArgs] = useState<boolean[]>([]);
+  const [hasAttemptedExecute, setHasAttemptedExecute] = useState(false);
   const [payableValue, setPayableValue] = useState('');
   const [functionSearch, setFunctionSearch] = useState('');
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [executionResult, setExecutionResult] = useState<ExecutionResult | null>(null);
   const [isMobileConsoleOpen, setIsMobileConsoleOpen] = useState(false);
+  const [isMobileFunctionDrawerOpen, setIsMobileFunctionDrawerOpen] = useState(false);
   
   // Storage State
   const [activeContractId, setActiveContractId] = useState<string | null>(null);
@@ -423,6 +501,23 @@ function DebuggerContent() {
     localStorage.setItem('debugger_sidebar_tab', tab);
   };
 
+  const selectContractFunction = (func: ABIFunction) => {
+    setSelectedFunc(func);
+    setFuncArgs(new Array(func.inputs.length).fill(''));
+    setTouchedArgs(new Array(func.inputs.length).fill(false));
+    setHasAttemptedExecute(false);
+    setPayableValue('');
+    setExecutionResult(null);
+    if (window.innerWidth < 768) setIsMobileFunctionDrawerOpen(true);
+  };
+
+  useEffect(() => {
+    if (!isMobileFunctionDrawerOpen && !isMobileConsoleOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = previousOverflow; };
+  }, [isMobileFunctionDrawerOpen, isMobileConsoleOpen]);
+
   const addLog = (type: LogEntry['type'], message: string, data?: any) => {
     setLogs(prev => [{ timestamp: new Date(), type, message, data }, ...prev]);
   };
@@ -449,7 +544,7 @@ function DebuggerContent() {
 
   const loadContract = (contract: SavedContract) => {
     setContractName(contract.name); setAddress(contract.address); setAbiInput(contract.abi); setFunctionNotes(contract.notes || {});
-    setActiveContractId(contract.id); addLog('info', `Loaded: ${contract.name}`); selectSidebarTab('read');
+    setActiveContractId(contract.id); addLog('info', `Loaded: ${contract.name}`); selectSidebarTab('read'); setIsMobileFunctionDrawerOpen(false);
   };
 
   const deleteContract = (id: string, e: React.MouseEvent) => {
@@ -460,15 +555,18 @@ function DebuggerContent() {
   };
 
   useEffect(() => {
-    if (!abiInput.trim()) { setParsedAbi([]); setAbiError(''); return; }
+    if (!abiInput.trim()) { setParsedAbi([]); setParsedAbiErrors([]); setAbiError(''); return; }
     try {
       const parsed = JSON.parse(abiInput.trim());
       if (!Array.isArray(parsed)) throw new Error('ABI must be a JSON array');
       const functions = parsed.filter((item: any) => item.type === 'function');
+      const errors = parsed.filter((item: any) => item.type === 'error');
       setParsedAbi(functions);
+      setParsedAbiErrors(errors);
       setAbiError(functions.length ? '' : 'ABI contains no functions');
     } catch (error) {
       setParsedAbi([]);
+      setParsedAbiErrors([]);
       setAbiError(error instanceof Error ? error.message : 'Invalid ABI JSON');
     }
   }, [abiInput]);
@@ -480,8 +578,14 @@ function DebuggerContent() {
     }
     const formattedArgs = funcArgs.map(arg => typeof arg === 'string' ? arg.trim() : arg);
     const parameterErrors = selectedFunc.inputs.map((input, index) => validateParamValue(input, formattedArgs[index])).filter(Boolean);
-    if (parameterErrors.length) { addLog('error', 'Fix invalid function parameters', parameterErrors); return; }
+    if (parameterErrors.length) {
+      setHasAttemptedExecute(true);
+      addLog('error', 'Fix invalid function parameters', parameterErrors);
+      setExecutionResult({ type: 'error', title: 'Invalid parameters', data: parameterErrors });
+      return;
+    }
     setIsLoading(true); addLog('info', `Calling ${selectedFunc.name}...`, formattedArgs);
+    setExecutionResult({ type: 'info', title: 'Executing', data: 'Preparing contract call...' });
     
     try {
       const trimmedAddress = address.trim();
@@ -491,15 +595,18 @@ function DebuggerContent() {
       // Normalize pasted mixed-case addresses to their EIP-55 checksum form.
       const contractAddress = getAddress(trimmedAddress.toLowerCase());
 
+      const callAbi = [selectedFunc, ...parsedAbiErrors];
       if (['view', 'pure'].includes(selectedFunc.stateMutability)) {
         // READ
         const result = await publicClient.readContract({
           address: contractAddress,
-          abi: [selectedFunc],
+          abi: callAbi,
           functionName: selectedFunc.name,
           args: formattedArgs
         });
-        addLog('success', `Result (${selectedFunc.name})`, JSON.stringify(result, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2));
+        const serializedResult = toSerializable(result);
+        addLog('success', `Result (${selectedFunc.name})`, JSON.stringify(serializedResult, null, 2));
+        setExecutionResult({ type: 'success', title: 'Result', data: serializedResult });
       } else {
         // WRITE
         if (!walletAddress) throw new Error("Connect Wallet");
@@ -509,7 +616,7 @@ function DebuggerContent() {
         addLog('info', 'Simulating transaction...');
         const simulation = await publicClient.simulateContract({
           address: contractAddress,
-          abi: [selectedFunc],
+          abi: callAbi,
           functionName: selectedFunc.name,
           args: formattedArgs,
           account: walletAddress,
@@ -517,14 +624,25 @@ function DebuggerContent() {
         });
         const estimatedGas = await publicClient.estimateContractGas(simulation.request);
         addLog('success', 'Simulation passed', { estimatedGas: estimatedGas.toString() });
+        setExecutionResult({ type: 'info', title: 'Simulation passed', data: { estimatedGas: estimatedGas.toString(), status: 'Waiting for wallet confirmation' } });
         const hash = await writeContractAsync(simulation.request);
         addLog('info', 'Transaction sent', { hash });
         const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        addLog('success', 'Confirmed', { status: receipt.status, block: receipt.blockNumber.toString(), gasUsed: receipt.gasUsed.toString(), hash: receipt.transactionHash || hash });
+        const receiptResult = { status: receipt.status, block: receipt.blockNumber.toString(), gasUsed: receipt.gasUsed.toString(), hash: receipt.transactionHash || hash };
+        addLog('success', 'Confirmed', receiptResult);
+        setExecutionResult({ type: 'success', title: 'Transaction confirmed', data: receiptResult });
       }
     } catch (err: any) {
       console.error(err);
-      addLog('error', 'Failed', err.shortMessage || err.message);
+      const decodedError = decodeContractError(err, parsedAbiErrors);
+      if (decodedError) {
+        addLog('error', `Reverted: ${decodedError.errorName}`, decodedError);
+        setExecutionResult({ type: 'error', title: `Reverted: ${decodedError.errorName}`, data: decodedError });
+      } else {
+        const errorMessage = err.shortMessage || err.message;
+        addLog('error', 'Failed', errorMessage);
+        setExecutionResult({ type: 'error', title: 'Execution failed', data: errorMessage });
+      }
     } finally { setIsLoading(false); }
   };
 
@@ -538,24 +656,25 @@ function DebuggerContent() {
   const savedChainId = selectedSavedContract?.networkId ? Number(selectedSavedContract.networkId) : undefined;
   const networkMismatch = Boolean(savedChainId && chainId && savedChainId !== chainId);
   const activeChain = SUPPORTED_CHAINS.find(chain => chain.id === chainId);
+  const executionResultText = executionResult ? (typeof executionResult.data === 'string' ? executionResult.data : JSON.stringify(toSerializable(executionResult.data), null, 2)) : '';
 
   return (
     <RainbowKitProvider theme={APP_THEMES[currentThemeKey].rkTheme()}>
-    <div className={`flex flex-col h-screen min-w-[320px] font-sans overflow-hidden transition-colors duration-300 ${t.bgMain} ${t.textMain}`}>
+    <div className={`flex flex-col min-h-dvh md:h-screen min-w-[320px] font-sans overflow-y-auto md:overflow-hidden transition-colors duration-300 ${t.bgMain} ${t.textMain}`}>
       
       {/* HEADER */}
-      <header className={`h-[72px] border-b ${t.border} ${t.bgHeader} backdrop-blur-xl flex items-center justify-between px-4 lg:px-6 shrink-0 z-20 transition-colors duration-300`}>
+      <header className={`sticky top-0 md:static h-[72px] border-b ${t.border} ${t.bgHeader} backdrop-blur-xl flex items-center justify-between px-3 sm:px-4 lg:px-6 shrink-0 z-20 transition-colors duration-300`}>
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20 ring-1 ring-white/10">
             <Code2 size={21} className="text-white" />
           </div>
-          <div>
+          <div className="hidden sm:block">
             <h1 className="font-bold text-base sm:text-lg tracking-tight leading-none">Contract<span className="text-blue-400">Debugger</span></h1>
             <div className={`hidden sm:flex items-center gap-1.5 mt-1.5 text-[10px] uppercase tracking-[0.16em] ${t.textDim}`}><CircleDot size={9} className="text-emerald-400" /> EVM workspace</div>
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-4">
           {/* Theme Switcher */}
           <div className="relative">
             <button aria-label="Change color theme" onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)} className={`p-2.5 rounded-xl border ${t.border} ${t.bgCard} ${t.textDim} hover:text-blue-400 hover:border-blue-500/40 transition-colors`}>
@@ -584,18 +703,18 @@ function DebuggerContent() {
 
       {/* MAIN */}
       <main
-        className="flex flex-col md:flex-row flex-1 overflow-hidden"
+        className="flex flex-col md:flex-row flex-none md:flex-1 overflow-visible md:overflow-hidden"
         style={{
           '--left-panel-width': `${leftPanelWidth}px`,
           '--console-panel-width': `${consolePanelWidth}px`,
         } as React.CSSProperties}
       >
         {/* LEFT SIDEBAR */}
-        <aside className={`w-full md:w-[var(--left-panel-width)] h-[43%] md:h-auto border-b md:border-b-0 ${t.border} ${t.bgSidebar} flex flex-col shrink-0 z-0 transition-colors duration-300`}>
+        <aside className={`w-full md:w-[var(--left-panel-width)] h-auto border-b md:border-b-0 ${t.border} ${t.bgSidebar} flex flex-col shrink-0 z-0 transition-colors duration-300`}>
           <div className={`p-4 border-b ${t.border} space-y-3`}>
              <div className="flex items-center justify-between">
                <div className={`text-[10px] font-bold uppercase tracking-[0.16em] ${t.textDim}`}>Contract workspace</div>
-               <div className={`text-[10px] font-mono ${t.textDim}`}>{parsedAbi.length} functions</div>
+               <div className={`text-[10px] font-mono ${t.textDim}`}>{parsedAbi.length} functions{parsedAbiErrors.length > 0 ? ` · ${parsedAbiErrors.length} errors` : ''}</div>
              </div>
              <div className="flex gap-2">
                 <input type="text" value={contractName} onChange={(e) => setContractName(e.target.value)} placeholder="Contract Name" 
@@ -632,7 +751,7 @@ function DebuggerContent() {
             ))}
           </div>
 
-          <div className="flex-1 overflow-y-auto">
+          <div className="max-h-[42dvh] md:max-h-none md:flex-1 overflow-y-auto overscroll-contain">
             {activeSidebarTab === 'saved' ? (
               <div className="p-2 space-y-2">
                 {savedContracts.map(c => (
@@ -647,11 +766,10 @@ function DebuggerContent() {
               </div>
             ) : (
               <div>
-                {activeFunctions.map((func, idx) => (
-                  <button key={functionKey(func)} onClick={() => { setSelectedFunc(func); setFuncArgs(new Array(func.inputs.length).fill('')); setPayableValue(''); }}
+                {activeFunctions.map((func) => (
+                  <button key={functionKey(func)} onClick={() => selectContractFunction(func)}
                     className={`w-full text-left px-4 py-3.5 border-b border-l-2 ${t.border} ${t.bgHover} transition-colors flex items-center justify-between group ${selectedFunc === func ? `${t.bgActive}` : 'border-l-transparent'}`}>
                     <div className={`flex items-center gap-2 min-w-0 pr-2 font-mono text-sm ${t.textMain}`}>
-                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${['view', 'pure'].includes(func.stateMutability) ? 'bg-cyan-400' : 'bg-orange-400'}`} />
                         <span className="truncate" title={functionKey(func)}>{functionKey(func)}</span> {functionNotes[functionKey(func)] && <StickyNote size={12} className="text-amber-500 shrink-0" />}
                     </div>
                     <ChevronRight size={14} className={`${t.textDim} opacity-0 group-hover:opacity-100`} />
@@ -683,15 +801,21 @@ function DebuggerContent() {
         </div>
 
         {/* EXECUTION PANEL */}
-        <section className={`flex-1 min-w-0 flex flex-col ${t.bgMain} relative overflow-hidden transition-colors duration-300 before:absolute before:inset-0 before:pointer-events-none before:bg-[radial-gradient(circle_at_50%_0%,rgba(37,99,235,0.08),transparent_38%)]`}>
+        {isMobileFunctionDrawerOpen && <div className="md:hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" onClick={() => setIsMobileFunctionDrawerOpen(false)} />}
+        <section role={isMobileFunctionDrawerOpen ? 'dialog' : undefined} aria-modal={isMobileFunctionDrawerOpen ? true : undefined} aria-label={isMobileFunctionDrawerOpen ? 'Execute contract function' : undefined} id="execution-panel" className={`${isMobileFunctionDrawerOpen ? 'mobile-function-drawer z-[60] flex rounded-t-3xl border-t shadow-2xl' : 'hidden'} md:static md:z-auto md:flex md:h-auto md:rounded-none md:border-t-0 md:shadow-none flex-1 min-w-0 md:min-h-0 flex-col ${t.bgMain} ${t.border} relative overflow-hidden transition-colors duration-300 before:absolute before:inset-0 before:pointer-events-none before:bg-[radial-gradient(circle_at_50%_0%,rgba(37,99,235,0.08),transparent_38%)]`}>
           {selectedFunc ? (
-            <div className="flex flex-col h-full">
+            <div className="flex flex-col h-full min-h-0">
+              <div className={`md:hidden relative h-9 shrink-0 border-b ${t.border}`}><div className="absolute top-2 left-1/2 -translate-x-1/2 w-10 h-1 rounded-full bg-slate-500/40"/><button aria-label="Close function drawer" onClick={() => setIsMobileFunctionDrawerOpen(false)} className={`absolute top-1 right-3 p-1.5 rounded-lg ${t.bgCard} ${t.textDim}`}><X size={15}/></button></div>
               <div className={`relative p-5 lg:p-6 border-b ${t.border} ${t.bgHeader} backdrop-blur-xl`}>
-                <div className="flex items-center gap-3 mb-2">
-                  <span className={`px-2 py-1 rounded text-xs font-bold uppercase ${['view', 'pure'].includes(selectedFunc.stateMutability) ? t.accentSecondary : 'bg-orange-900/30 text-orange-400 border border-orange-800'}`}>
+                <div className="flex items-start justify-between gap-4 mb-2">
+                  <div className="min-w-0">
+                    <p className={`text-[10px] font-semibold uppercase tracking-[0.16em] mb-2 ${t.textDim}`}>Contract function</p>
+                    <h2 className={`text-xl font-semibold font-mono truncate ${t.textMain}`}>{selectedFunctionKey}</h2>
+                    <p className={`text-xs mt-1.5 ${t.textDim}`}>{selectedFunc.inputs.length} input{selectedFunc.inputs.length === 1 ? '' : 's'} · {selectedFunc.outputs?.length || 0} output{selectedFunc.outputs?.length === 1 ? '' : 's'}</p>
+                  </div>
+                  <span className={`shrink-0 inline-flex items-center px-2.5 py-1.5 rounded-full border text-[10px] font-semibold uppercase tracking-wider ${selectedFunc.stateMutability === 'payable' ? t.badgePayable : ['view', 'pure'].includes(selectedFunc.stateMutability) ? t.badgeRead : t.badgeWrite}`}>
                     {selectedFunc.stateMutability}
                   </span>
-                  <div className="min-w-0"><h2 className={`text-xl font-semibold font-mono truncate ${t.textMain}`}>{selectedFunctionKey}</h2><p className={`text-xs mt-1 ${t.textDim}`}>{selectedFunc.inputs.length} input{selectedFunc.inputs.length === 1 ? '' : 's'} · {selectedFunc.outputs?.length || 0} output{selectedFunc.outputs?.length === 1 ? '' : 's'}</p></div>
                 </div>
                 {networkMismatch && <div className="mt-3 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs flex items-center justify-between gap-3"><span className="flex items-center gap-2"><AlertTriangle size={14}/>Saved on chain {savedChainId}, connected to {chainId}</span><button onClick={() => savedChainId && switchChainAsync({ chainId: savedChainId })} className="px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 font-medium">Switch network</button></div>}
                 <div className="relative group mt-4">
@@ -702,24 +826,26 @@ function DebuggerContent() {
                 </div>
               </div>
 
-              <div className="relative flex-1 overflow-y-auto p-4 md:p-6 lg:p-8">
+              <div className="relative flex-1 min-h-0 overflow-y-auto p-4 md:p-6 lg:p-8">
                 <div className="max-w-3xl mx-auto">
                   <div className="flex items-center justify-between mb-5">
                     <div><h3 className={`text-sm font-semibold ${t.textMain}`}>Call parameters</h3><p className={`text-xs mt-1 ${t.textDim}`}>Values are encoded according to the loaded ABI.</p></div>
                     <Braces size={18} className={t.textDim} />
                   </div>
                   {selectedFunc.inputs.map((input, idx) => (
-                    <DynamicInput key={idx} type={input.type} name={input.name} value={funcArgs[idx]} components={input.components} colors={t} currentUserAddress={walletAddress} error={selectedParameterErrors[idx]}
-                      onChange={(val) => { const newArgs = [...funcArgs]; newArgs[idx] = val; setFuncArgs(newArgs); }} />
+                    <DynamicInput key={idx} type={input.type} name={input.name} value={funcArgs[idx]} components={input.components} colors={t} currentUserAddress={walletAddress} error={(touchedArgs[idx] || hasAttemptedExecute) ? selectedParameterErrors[idx] : null}
+                      onBlur={() => setTouchedArgs(current => current.map((touched, index) => index === idx ? true : touched))}
+                      onChange={(val) => { const newArgs = [...funcArgs]; newArgs[idx] = val; setFuncArgs(newArgs); setTouchedArgs(current => current.map((touched, index) => index === idx ? true : touched)); }} />
                   ))}
                   {selectedFunc.inputs.length === 0 && <div className={`${t.textDim} p-8 ${t.bgCard} rounded-2xl border ${t.border} flex flex-col items-center text-center gap-3`}><Box size={22}/><div><p className={`text-sm font-medium ${t.textMain}`}>No parameters required</p><p className="text-xs mt-1">This function can be executed directly.</p></div></div>}
                   {selectedFunc.stateMutability === 'payable' && <div className={`mt-5 p-4 border ${t.border} ${t.bgCard} rounded-2xl`}><label className={`text-xs font-medium ${t.textMain}`}>Native token value <span className={t.textDim}>({activeChain?.nativeCurrency.symbol || 'native'})</span></label><input value={payableValue} onChange={(event) => setPayableValue(event.target.value)} inputMode="decimal" placeholder="0.0" className={`mt-2 w-full ${t.bgInput} border ${t.border} rounded-xl px-3.5 py-2.5 font-mono text-sm ${t.textMain} outline-none focus:border-blue-500/60`} /><p className={`text-[10px] mt-1.5 ${t.textDim}`}>Sent as transaction value; leave empty for zero.</p></div>}
+                  {executionResult && <div className={`md:hidden mt-5 rounded-2xl border overflow-hidden ${executionResult.type === 'success' ? 'border-emerald-500/30 bg-emerald-500/5' : executionResult.type === 'error' ? 'border-red-500/30 bg-red-500/5' : 'border-blue-500/30 bg-blue-500/5'}`}><div className={`px-4 py-3 border-b flex items-center justify-between gap-3 ${executionResult.type === 'success' ? 'border-emerald-500/20' : executionResult.type === 'error' ? 'border-red-500/20' : 'border-blue-500/20'}`}><div className="flex items-center gap-2 min-w-0"><Terminal size={14} className={executionResult.type === 'success' ? 'text-emerald-400' : executionResult.type === 'error' ? 'text-red-400' : 'text-blue-400'}/><span className={`text-xs font-semibold truncate ${t.textMain}`}>{executionResult.title}</span></div>{executionResultText && <button onClick={() => navigator.clipboard.writeText(executionResultText)} className={`shrink-0 flex items-center gap-1 text-[10px] ${t.textDim} hover:text-blue-400`}><Copy size={11}/>Copy</button>}</div>{executionResultText && <pre className={`p-4 max-h-52 overflow-auto font-mono text-xs leading-relaxed whitespace-pre-wrap break-all ${t.textMain}`}>{executionResultText}</pre>}</div>}
                 </div>
               </div>
 
-              <div className={`relative p-4 lg:p-5 border-t ${t.border} ${t.bgHeader} backdrop-blur-xl`}>
+              <div className={`relative p-4 pb-[max(1rem,env(safe-area-inset-bottom))] lg:p-5 border-t ${t.border} ${t.bgHeader} backdrop-blur-xl shrink-0`}>
                 <div className="max-w-3xl mx-auto flex items-center gap-4">
-                  <button onClick={executeFunction} disabled={isLoading || networkMismatch || selectedParameterErrors.some(Boolean) || (!walletAddress && !['view', 'pure'].includes(selectedFunc.stateMutability))}
+                  <button onClick={executeFunction} disabled={isLoading || networkMismatch || (!walletAddress && !['view', 'pure'].includes(selectedFunc.stateMutability))}
                     className={`flex-1 py-3 px-6 rounded-xl font-semibold text-white flex items-center justify-center gap-2 transition-colors shadow-lg shadow-blue-950/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950
                       ${isLoading ? 'bg-slate-500 cursor-not-allowed' : t.accentPrimary}`}>
                     {isLoading ? <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <><Play size={18} fill="currentColor" /> Run</>}
@@ -789,7 +915,7 @@ export default function ContractDebuggerPage() {
   const [projectIdReady, setProjectIdReady] = useState(true);
 
   useEffect(() => {
-    const frame = requestAnimationFrame(() => {
+    const initialization = window.setTimeout(() => {
       const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID?.trim() || FALLBACK_WALLETCONNECT_PROJECT_ID;
       const hasValidProjectId = projectId !== FALLBACK_WALLETCONNECT_PROJECT_ID;
       setProjectIdReady(hasValidProjectId);
@@ -808,7 +934,7 @@ export default function ContractDebuggerPage() {
       );
     });
 
-    return () => cancelAnimationFrame(frame);
+    return () => window.clearTimeout(initialization);
   }, []);
 
   // 仅在客户端初始化 wagmi，避免构建/预渲染阶段触发 indexedDB

@@ -39,3 +39,17 @@ button:disabled { cursor: not-allowed; }
     animation-iteration-count: 1 !important;
   }
 }
+
+@media (max-width: 767px) {
+  .mobile-function-drawer {
+    position: fixed !important;
+    top: max(72px, 10dvh) !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+  }
+}
